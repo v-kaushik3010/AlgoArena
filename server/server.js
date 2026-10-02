@@ -17,6 +17,16 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+app.get("/health", (req,res)=>{
+  res.status(200).json({
+    status: "OK",
+    message: "AlgoArena server is running"
+  });
+});
+
+
+
 app.use("/api/auth", authRoutes);
 app.use("/api/problems", problemRoutes);
 app.use("/api/submissions", submissionRoutes);
