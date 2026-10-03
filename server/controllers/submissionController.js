@@ -42,13 +42,21 @@ exports.createSubmission = async (req, res) => {
       const result = await executeCode(
         language,
         code,
-        testCase.input
+        testCase.input,
+        problem.timeLimit || 2   // pass per-problem time limit (seconds)
       );
 
       console.log("Execution Result:", result);
 
-      // ❌ Runtime error
-      if (result.error) {
+      // ❌ Time Limit Exceeded (hard-killed by the judge)
+      if (result.verdict === "Time Limit Exceeded") {
+        verdict = "Time Limit Exceeded";
+        executionTime = result.executionTime || 0;
+        break;
+      }
+
+      // ❌ Runtime error (non-zero exit / exception)
+      if (result.error && !result.output) {
 
         verdict = "Runtime Error";
 
@@ -57,7 +65,7 @@ exports.createSubmission = async (req, res) => {
         break;
       }
 
-      // ✅ Normalize outputs
+      // ✅ Normalize outputs (trim trailing whitespace / newlines)
       const actualOutput =
         result.output?.toString().trim();
 
@@ -75,7 +83,7 @@ exports.createSubmission = async (req, res) => {
         break;
       }
 
-      // Optional metrics
+      // Track metrics from the last passing test case
       executionTime =
         result.executionTime || 0;
 
