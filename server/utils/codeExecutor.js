@@ -1,44 +1,125 @@
 /**
- * AlgoArena Code Executor — Free, self-hosted judge
+ * AlgoArena Code Executor
  *
- * Runs user code in isolated child processes (child_process.spawn).
- * Works on any machine that has the runtime installed:
- *   - JavaScript → Node.js (always available — this IS the server runtime)
- *   - Python     → python3 (pre-installed on Render's Ubuntu image)
- *   - Java       → javac + java (installed via render.yaml build command)
+ * Two-tier execution strategy (zero cost, no API key):
  *
- * Each test case:
- *   1. Source is written to a temp file
- *   2. Process is spawned, test input piped to stdin
- *   3. Hard wall-clock timeout enforced (SIGKILL)
- *   4. stdout compared to expected output by the submission controller
+ * TIER 1 — Wandbox API (https://wandbox.org)
+ *   Free, no auth, supports Java/Python/JS/C++.
+ *   Used as the primary engine so the server needs no compilers installed.
+ *   Perfect for Render, Railway, Fly.io, or any Node.js hosting.
  *
- * Security note: User code runs directly on the server process.
- * Acceptable for personal / educational projects. Add Docker sandboxing
- * for a public-facing platform with untrusted users.
+ * TIER 2 — Local child_process.spawn (fallback)
+ *   Kicks in if Wandbox is unreachable (e.g. offline dev, network blip).
+ *   Requires the runtime to be installed on the host machine.
  */
 
+const axios  = require("axios");
 const { spawn } = require("child_process");
-const fs   = require("fs");
-const path = require("path");
-const os   = require("os");
+const fs     = require("fs");
+const path   = require("path");
+const os     = require("os");
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Wandbox config ───────────────────────────────────────────────────────────
+// https://wandbox.org/api/list.json shows all available compilers
 
-function writeTempFile(content, extension) {
-  const name = `algoarena_${Date.now()}_${Math.random().toString(36).slice(2)}${extension}`;
-  const fp   = path.join(os.tmpdir(), name);
+const WANDBOX_URL = "https://wandbox.org/api/compile.json";
+
+const WANDBOX_COMPILERS = {
+  javascript: "nodejs-20.17.0",
+  js:         "nodejs-20.17.0",
+  python:     "cpython-3.14.0",
+  python3:    "cpython-3.14.0",
+  java:       "openjdk-jdk-22+36",
+  cpp:        "gcc-head",
+};
+
+// ─── Wandbox runner ───────────────────────────────────────────────────────────
+
+async function runViaWandbox(language, code, input, timeLimitSeconds) {
+  const compiler = WANDBOX_COMPILERS[language.toLowerCase()];
+  if (!compiler) {
+    return {
+      output: null,
+      error: `Unsupported language: "${language}". Supported: javascript, python, java, cpp.`,
+      executionTime: 0, memoryUsed: 0, verdict: "Runtime Error",
+    };
+  }
+
+  const start = Date.now();
+
+  // Wandbox saves Java as "prog.java" — `public class Main` would fail.
+  // Removing `public` is safe: non-public classes have no filename constraint.
+  let execCode = code;
+  if (language === "java") {
+    execCode = code.replace(/public\s+class\s+Main/, "class Main");
+  }
+
+  const response = await axios.post(
+    WANDBOX_URL,
+    {
+      code: execCode,
+      compiler,
+      stdin: input || "",
+      "compiler-option-raw": "",
+      "runtime-option-raw":  "",
+    },
+    {
+      headers: { "Content-Type": "application/json" },
+      timeout: (timeLimitSeconds + 20) * 1000,
+    }
+  );
+
+  const d = response.data;
+  const elapsedMs = Date.now() - start;
+
+  // ── Compilation error (Java / C++) ─────────────────────────────────────────
+  if (d.compiler_error && d.compiler_error.trim()) {
+    return {
+      output: null,
+      error: d.compiler_error.trim(),
+      executionTime: elapsedMs / 1000, memoryUsed: 0, verdict: null,
+    };
+  }
+
+  // ── Signal-killed (TLE / MLE / OOM) ───────────────────────────────────────
+  if (d.signal) {
+    return {
+      output: null,
+      error: "Time Limit Exceeded",
+      executionTime: timeLimitSeconds, memoryUsed: 0, verdict: "Time Limit Exceeded",
+    };
+  }
+
+  // ── Runtime error (non-zero exit + stderr) ────────────────────────────────
+  const exitCode = parseInt(d.status, 10);
+  if (exitCode !== 0 && d.program_error && d.program_error.trim()) {
+    return {
+      output: null,
+      error: d.program_error.trim(),
+      executionTime: elapsedMs / 1000, memoryUsed: 0, verdict: null,
+    };
+  }
+
+  // ── Success ───────────────────────────────────────────────────────────────
+  return {
+    output: d.program_output || "",
+    error:  d.program_error  || null,
+    executionTime: elapsedMs / 1000,
+    memoryUsed: 0,
+    verdict: null,
+  };
+}
+
+// ─── Local subprocess fallback ────────────────────────────────────────────────
+
+function writeTempFile(content, ext) {
+  const fp = path.join(os.tmpdir(), `algoarena_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
   fs.writeFileSync(fp, content, "utf8");
   return fp;
 }
 
-function safeDelete(fp) {
-  try { fs.unlinkSync(fp); } catch (_) {}
-}
+function safeDelete(fp) { try { fs.unlinkSync(fp); } catch (_) {} }
 
-/**
- * Spawn a process, pipe stdin, collect stdout/stderr, enforce a hard timeout.
- */
 function runProcess(cmd, args, stdin, timeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -52,10 +133,7 @@ function runProcess(cmd, args, stdin, timeoutMs) {
     child.stdout.on("data", (d) => (stdout += d.toString()));
     child.stderr.on("data", (d) => (stderr += d.toString()));
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
 
     child.on("close", (exitCode) => {
       clearTimeout(timer);
@@ -68,101 +146,54 @@ function runProcess(cmd, args, stdin, timeoutMs) {
   });
 }
 
-// ─── Language runners ─────────────────────────────────────────────────────────
-
-async function runJavaScript(code, input, timeoutMs) {
-  const fp = writeTempFile(code, ".js");
-  try {
-    return await runProcess("node", [fp], input, timeoutMs);
-  } finally {
-    safeDelete(fp);
-  }
-}
-
-async function runPython(code, input, timeoutMs) {
-  const fp = writeTempFile(code, ".py");
-  try {
-    // -u = unbuffered I/O (no lost output on crash)
-    // Try "python3" first (Linux/Render), fall back to "python" (Windows/some Linux)
-    let result = await runProcess("python3", ["-u", fp], input, timeoutMs);
-    if (result.exitCode === -1 && result.stderr.includes("ENOENT")) {
-      result = await runProcess("python", ["-u", fp], input, timeoutMs);
-    }
-    return result;
-  } finally {
-    safeDelete(fp);
-  }
-}
-
-/**
- * Java: compile with javac, then run.
- * Submission MUST declare `public class Main` (competitive programming convention).
- */
-async function runJava(code, input, timeoutMs) {
-  const subDir = path.join(
-    os.tmpdir(),
-    `algoarena_java_${Date.now()}_${Math.random().toString(36).slice(2)}`
-  );
-  fs.mkdirSync(subDir, { recursive: true });
-  const javaFile = path.join(subDir, "Main.java");
-  fs.writeFileSync(javaFile, code, "utf8");
-
-  try {
-    // Compile (10 s hard limit)
-    const compile = await runProcess("javac", [javaFile], "", 10_000);
-    if (compile.exitCode !== 0 || compile.timedOut) {
-      return {
-        stdout: "",
-        stderr: compile.timedOut ? "Compilation timed out" : compile.stderr,
-        exitCode: compile.exitCode,
-        timedOut: compile.timedOut,
-        elapsedMs: compile.elapsedMs,
-      };
-    }
-    // Run
-    return await runProcess("java", ["-cp", subDir, "Main"], input, timeoutMs);
-  } finally {
-    try { fs.rmSync(subDir, { recursive: true, force: true }); } catch (_) {}
-  }
-}
-
-// ─── Main export ──────────────────────────────────────────────────────────────
-
-/**
- * Execute user code against a single test case.
- *
- * @param {string} language           "javascript" | "python" | "java"
- * @param {string} code               user's source code
- * @param {string} input              test-case input piped to stdin
- * @param {number} [timeLimitSeconds=2]
- *
- * @returns {Promise<{
- *   output: string|null,
- *   error:  string|null,
- *   executionTime: number,    // seconds
- *   memoryUsed: number,       // 0 (tracking is non-trivial cross-platform)
- *   verdict: string|null,     // "Time Limit Exceeded" | "Runtime Error" | null
- * }>}
- */
-const executeCode = async (language, code, input, timeLimitSeconds = 2) => {
-  const timeoutMs = timeLimitSeconds * 1000;
-  const lang      = language.toLowerCase();
+async function runLocalFallback(language, code, input, timeLimitSeconds) {
+  const ms  = timeLimitSeconds * 1000;
+  const lang = language.toLowerCase();
   let raw;
 
-  try {
-    if      (lang === "javascript" || lang === "js")      raw = await runJavaScript(code, input, timeoutMs);
-    else if (lang === "python"     || lang === "python3") raw = await runPython(code, input, timeoutMs);
-    else if (lang === "java")                             raw = await runJava(code, input, timeoutMs);
-    else {
-      return {
-        output: null,
-        error: `Unsupported language: "${language}". Supported: javascript, python, java.`,
-        executionTime: 0, memoryUsed: 0, verdict: "Runtime Error",
-      };
+  if (lang === "javascript" || lang === "js") {
+    const fp = writeTempFile(code, ".js");
+    try   { raw = await runProcess("node", [fp], input, ms); }
+    finally { safeDelete(fp); }
+
+  } else if (lang === "python" || lang === "python3") {
+    const fp = writeTempFile(code, ".py");
+    try {
+      // Try python3 first (Linux/Render), fall back to python (Windows)
+      raw = await runProcess("python3", ["-u", fp], input, ms);
+      // On Windows: python3 may open MS Store (non-zero exit, no ENOENT)
+      const isNotFound = raw.exitCode === -1 ||
+        (raw.exitCode !== 0 && (raw.stderr.includes("ENOENT") || raw.stderr.includes("Python was not found")));
+      if (isNotFound) {
+        raw = await runProcess("python", ["-u", fp], input, ms);
+      }
+    } finally { safeDelete(fp); }
+
+  } else if (lang === "java") {
+    const subDir = path.join(os.tmpdir(), `algoarena_java_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(subDir, { recursive: true });
+    const javaFile = path.join(subDir, "Main.java");
+    fs.writeFileSync(javaFile, code, "utf8");
+    try {
+      const compile = await runProcess("javac", [javaFile], "", 10_000);
+      if (compile.exitCode !== 0 || compile.timedOut) {
+        return {
+          output: null,
+          error: compile.timedOut ? "Compilation timed out" : compile.stderr,
+          executionTime: compile.elapsedMs / 1000, memoryUsed: 0, verdict: null,
+        };
+      }
+      raw = await runProcess("java", ["-cp", subDir, "Main"], input, ms);
+    } finally {
+      try { fs.rmSync(subDir, { recursive: true, force: true }); } catch (_) {}
     }
-  } catch (err) {
-    console.error("[Judge] Execution error:", err.message);
-    return { output: null, error: err.message, executionTime: 0, memoryUsed: 0, verdict: "Runtime Error" };
+
+  } else {
+    return {
+      output: null,
+      error: `Unsupported language: "${language}"`,
+      executionTime: 0, memoryUsed: 0, verdict: "Runtime Error",
+    };
   }
 
   if (raw.timedOut) {
@@ -172,6 +203,47 @@ const executeCode = async (language, code, input, timeLimitSeconds = 2) => {
     return { output: null, error: raw.stderr.trim(), executionTime: raw.elapsedMs / 1000, memoryUsed: 0, verdict: null };
   }
   return { output: raw.stdout, error: raw.stderr || null, executionTime: raw.elapsedMs / 1000, memoryUsed: 0, verdict: null };
+}
+
+// ─── Main export ──────────────────────────────────────────────────────────────
+
+/**
+ * Execute user code against a single test-case input.
+ *
+ * @param {string} language           "javascript" | "python" | "java" | "cpp"
+ * @param {string} code               user's source code
+ * @param {string} input              test-case stdin
+ * @param {number} [timeLimitSeconds=2]
+ *
+ * @returns {Promise<{ output, error, executionTime, memoryUsed, verdict }>}
+ */
+const executeCode = async (language, code, input, timeLimitSeconds = 2) => {
+  const lang = language.toLowerCase();
+
+  // ── Tier 1: Wandbox (works on any server, no host compilers needed) ────────
+  try {
+    console.log(`[Judge] Wandbox → ${lang}`);
+    const result = await runViaWandbox(lang, code, input, timeLimitSeconds);
+    console.log(`[Judge] Wandbox ok — verdict=${result.verdict} out="${result.output?.slice(0, 40)}"`);
+    return result;
+  } catch (wandboxErr) {
+    console.warn(`[Judge] Wandbox unavailable (${wandboxErr.message}), falling back to local...`);
+  }
+
+  // ── Tier 2: Local subprocess (dev machines / Render with compilers) ────────
+  try {
+    console.log(`[Judge] Local subprocess → ${lang}`);
+    const result = await runLocalFallback(lang, code, input, timeLimitSeconds);
+    console.log(`[Judge] Local ok — verdict=${result.verdict} out="${result.output?.slice(0, 40)}"`);
+    return result;
+  } catch (localErr) {
+    console.error(`[Judge] Both tiers failed: ${localErr.message}`);
+    return {
+      output: null,
+      error: "Execution service temporarily unavailable. Please try again.",
+      executionTime: 0, memoryUsed: 0, verdict: "Runtime Error",
+    };
+  }
 };
 
 module.exports = executeCode;
