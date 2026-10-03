@@ -30,6 +30,7 @@ function ProblemDetails() {
   const [code,     setCode]     = useState(TEMPLATES.java);
   const [language, setLanguage] = useState("java");
   const [verdict,  setVerdict]  = useState("");
+  const [errDetail, setErrDetail] = useState("");
   const [loading,  setLoading]  = useState(false);
 
   // Run panel state
@@ -72,6 +73,7 @@ function ProblemDetails() {
   const handleSubmit = async () => {
     setLoading(true);
     setVerdict("");
+    setErrDetail("");
     try {
       const user = JSON.parse(localStorage.getItem("user"));
       const res = await API.post(
@@ -80,8 +82,10 @@ function ProblemDetails() {
         { headers: { Authorization: `Bearer ${user.token}` } }
       );
       setVerdict(res.data.verdict);
+      setErrDetail(res.data.errorDetail || "");
     } catch (err) {
       setVerdict(err.response?.data?.verdict || "Submission Failed");
+      setErrDetail("");
     } finally {
       setLoading(false);
     }
@@ -329,7 +333,16 @@ function ProblemDetails() {
               color:      verdict === "Accepted" ? "#4ade80"   : "#f87171",
               border:     `1px solid ${verdict === "Accepted" ? "#22c55e" : "#ef4444"}`,
             }}>
-              Verdict: {verdict}
+              {verdict === "Accepted" ? "✅" : "❌"} Verdict: {verdict}
+              {errDetail && (
+                <pre style={{
+                  marginTop: 8, fontSize: 12, fontWeight: 400,
+                  color: "#fca5a5", fontFamily: "monospace",
+                  whiteSpace: "pre-wrap", wordBreak: "break-all",
+                }}>
+                  {errDetail}
+                </pre>
+              )}
             </div>
           )}
 

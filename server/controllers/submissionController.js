@@ -13,7 +13,7 @@ exports.runCode = async (req, res) => {
     const result = await executeCode(language, code, input || "", 5);
     return res.status(200).json({
       output: result.output || "",
-      error:  result.error  || null,
+      error: result.error || null,
       executionTime: result.executionTime,
       verdict: result.verdict || null,
     });
@@ -55,9 +55,10 @@ exports.createSubmission = async (req, res) => {
     let verdict = "Accepted";
     let executionTime = 0;
     let memoryUsed = 0;
+    let errorDetail = null;
     const timeLimit = problem.timeLimit || 2;
 
-    // 🚀 Run ALL test cases in PARALLEL (instead of sequentially)
+    // 🚀 Run ALL test cases in PARALLEL
     const results = await Promise.all(
       problem.testCases.map((tc) => executeCode(language, code, tc.input, timeLimit))
     );
@@ -70,17 +71,20 @@ exports.createSubmission = async (req, res) => {
       memoryUsed    = Math.max(memoryUsed,    result.memoryUsed    || 0);
 
       if (result.verdict === "Time Limit Exceeded") {
-        verdict = "Time Limit Exceeded";
+        verdict     = "Time Limit Exceeded";
+        errorDetail = `Time limit of ${timeLimit}s exceeded on test case ${i + 1}`;
         break;
       }
       if (result.error && !result.output) {
-        verdict = "Runtime Error";
+        verdict     = "Runtime Error";
+        errorDetail = result.error;
         break;
       }
-      const actual   = result.output?.toString().trim();
-      const expected = testCase.output?.toString().trim();
+      const actual   = (result.output || "").toString().trim();
+      const expected = (testCase.output || "").toString().trim();
       if (actual !== expected) {
-        verdict = "Wrong Answer";
+        verdict     = "Wrong Answer";
+        errorDetail = `Test ${i + 1}: expected "${expected}", got "${actual}"`;
         break;
       }
     }
@@ -138,7 +142,7 @@ exports.createSubmission = async (req, res) => {
       }
     }
 
-    res.status(201).json(submission);
+    res.status(201).json({ ...submission.toObject(), errorDetail });
 
   } catch (error) {
 
