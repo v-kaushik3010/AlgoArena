@@ -3,6 +3,26 @@ const Problem = require("../models/Problem");
 const User = require("../models/User");
 const executeCode = require("../utils/codeExecutor");
 
+// ▶️ Run Code (sample run — not graded, no submission saved)
+exports.runCode = async (req, res) => {
+  try {
+    const { code, language, input } = req.body;
+    if (!code || !language) {
+      return res.status(400).json({ message: "code and language are required" });
+    }
+    const result = await executeCode(language, code, input || "", 5);
+    return res.status(200).json({
+      output: result.output || "",
+      error:  result.error  || null,
+      executionTime: result.executionTime,
+      verdict: result.verdict || null,
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+
 // 🚀 Create Submission
 exports.createSubmission = async (req, res) => {
   try {
