@@ -55,61 +55,36 @@ exports.createSubmission = async (req, res) => {
     let verdict = "Accepted";
     let executionTime = 0;
     let memoryUsed = 0;
+    const timeLimit = problem.timeLimit || 2;
 
-    // 🚀 Run against all testcases
-    for (const testCase of problem.testCases) {
+    // 🚀 Run ALL test cases in PARALLEL (instead of sequentially)
+    const results = await Promise.all(
+      problem.testCases.map((tc) => executeCode(language, code, tc.input, timeLimit))
+    );
 
-      const result = await executeCode(
-        language,
-        code,
-        testCase.input,
-        problem.timeLimit || 2   // pass per-problem time limit (seconds)
-      );
+    for (let i = 0; i < results.length; i++) {
+      const result   = results[i];
+      const testCase = problem.testCases[i];
 
-      console.log("Execution Result:", result);
+      executionTime = Math.max(executionTime, result.executionTime || 0);
+      memoryUsed    = Math.max(memoryUsed,    result.memoryUsed    || 0);
 
-      // ❌ Time Limit Exceeded (hard-killed by the judge)
       if (result.verdict === "Time Limit Exceeded") {
         verdict = "Time Limit Exceeded";
-        executionTime = result.executionTime || 0;
         break;
       }
-
-      // ❌ Runtime error (non-zero exit / exception)
       if (result.error && !result.output) {
-
         verdict = "Runtime Error";
-
-        console.log("Runtime Error:", result.error);
-
         break;
       }
-
-      // ✅ Normalize outputs (trim trailing whitespace / newlines)
-      const actualOutput =
-        result.output?.toString().trim();
-
-      const expectedOutput =
-        testCase.output?.toString().trim();
-
-      console.log("Actual Output:", actualOutput);
-      console.log("Expected Output:", expectedOutput);
-
-      // ❌ Wrong Answer
-      if (actualOutput !== expectedOutput) {
-
+      const actual   = result.output?.toString().trim();
+      const expected = testCase.output?.toString().trim();
+      if (actual !== expected) {
         verdict = "Wrong Answer";
-
         break;
       }
-
-      // Track metrics from the last passing test case
-      executionTime =
-        result.executionTime || 0;
-
-      memoryUsed =
-        result.memoryUsed || 0;
     }
+
 
     // ✅ Create submission
     const submission = await Submission.create({

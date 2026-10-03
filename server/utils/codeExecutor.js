@@ -210,37 +210,47 @@ async function runLocalFallback(language, code, input, timeLimitSeconds) {
 /**
  * Execute user code against a single test-case input.
  *
+ * Strategy:
+ *   1. Local subprocess  — FAST (<1 s). Used when runtime is installed on host.
+ *   2. Wandbox API       — SLOW (~8 s). Fallback ONLY when local ENOENT
+ *      (runtime not installed, e.g. Java on Render's free tier).
+ *
+ * This means:
+ *   - Dev machine / Render + JS or Python → always local, always fast
+ *   - Render + Java (not pre-installed)   → Wandbox fallback (~8 s per call)
+ *
  * @param {string} language           "javascript" | "python" | "java" | "cpp"
  * @param {string} code               user's source code
  * @param {string} input              test-case stdin
  * @param {number} [timeLimitSeconds=2]
- *
  * @returns {Promise<{ output, error, executionTime, memoryUsed, verdict }>}
  */
 const executeCode = async (language, code, input, timeLimitSeconds = 2) => {
   const lang = language.toLowerCase();
 
-  // ── Tier 1: Wandbox (works on any server, no host compilers needed) ────────
+  // ── Tier 1: Local subprocess (always try first — fast) ───────────────────
   try {
-    console.log(`[Judge] Wandbox → ${lang}`);
-    const result = await runViaWandbox(lang, code, input, timeLimitSeconds);
-    console.log(`[Judge] Wandbox ok — verdict=${result.verdict} out="${result.output?.slice(0, 40)}"`);
-    return result;
-  } catch (wandboxErr) {
-    console.warn(`[Judge] Wandbox unavailable (${wandboxErr.message}), falling back to local...`);
+    const result = await runLocalFallback(lang, code, input, timeLimitSeconds);
+
+    // Only fall through to Wandbox if the runtime binary was NOT FOUND (ENOENT).
+    // User code errors (syntax, runtime crash, WA) must be returned immediately.
+    const isEnoent = result.error && result.error.includes("ENOENT");
+    if (!isEnoent) {
+      return result;
+    }
+    console.log(`[Judge] ${lang} not installed locally — trying Wandbox...`);
+  } catch (localErr) {
+    console.warn(`[Judge] Local spawn exception (${localErr.message}) — trying Wandbox...`);
   }
 
-  // ── Tier 2: Local subprocess (dev machines / Render with compilers) ────────
+  // ── Tier 2: Wandbox (only when runtime missing on host) ──────────────────
   try {
-    console.log(`[Judge] Local subprocess → ${lang}`);
-    const result = await runLocalFallback(lang, code, input, timeLimitSeconds);
-    console.log(`[Judge] Local ok — verdict=${result.verdict} out="${result.output?.slice(0, 40)}"`);
-    return result;
-  } catch (localErr) {
-    console.error(`[Judge] Both tiers failed: ${localErr.message}`);
+    return await runViaWandbox(lang, code, input, timeLimitSeconds);
+  } catch (wandboxErr) {
+    console.error(`[Judge] Wandbox also failed: ${wandboxErr.message}`);
     return {
       output: null,
-      error: "Execution service temporarily unavailable. Please try again.",
+      error: "Code execution unavailable. Please try again in a moment.",
       executionTime: 0, memoryUsed: 0, verdict: "Runtime Error",
     };
   }
