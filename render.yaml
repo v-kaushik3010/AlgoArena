@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: algoarena-backend
+    env: node
+    region: oregon
+
+    # Install Java (default-jdk) during build so the judge can compile/run Java submissions.
+    # Python 3 is pre-installed on Render's Ubuntu image.
+    # Node.js is always available since this IS a Node.js service.
+    buildCommand: apt-get update -qq && apt-get install -y -qq default-jdk && cd server && npm install
+    startCommand: cd server && node server.js
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      # Set MONGO_URI and JWT_SECRET in the Render dashboard (Environment tab)
+      # Do NOT add them here to avoid committing secrets to git.
+
+    # Free tier settings
+    plan: free

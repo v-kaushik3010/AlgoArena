@@ -1,74 +1,52 @@
 /**
- * AlgoArena — Free, self-hosted code judge
+ * AlgoArena Code Executor — Free, self-hosted judge
  *
- * Strategy (zero cost, no external APIs):
- *   - JavaScript  → spawned in a new Node.js child process
- *   - Python      → spawned with `python` (system Python 3)
- *   - Java        → compiled with `javac`, then run with `java`
+ * Runs user code in isolated child processes (child_process.spawn).
+ * Works on any machine that has the runtime installed:
+ *   - JavaScript → Node.js (always available — this IS the server runtime)
+ *   - Python     → python3 (pre-installed on Render's Ubuntu image)
+ *   - Java       → javac + java (installed via render.yaml build command)
  *
- * Each execution:
- *   1. Writes source code to a temp file
- *   2. Spawns a subprocess, piping `stdin` (the test-case input)
- *   3. Enforces a hard wall-clock timeout (kills the process if exceeded)
- *   4. Returns { output, error, executionTime, memoryUsed }
+ * Each test case:
+ *   1. Source is written to a temp file
+ *   2. Process is spawned, test input piped to stdin
+ *   3. Hard wall-clock timeout enforced (SIGKILL)
+ *   4. stdout compared to expected output by the submission controller
  *
- * Security note: This runs user code directly on the server.
- * For a production deployment add OS-level sandboxing (Docker / firejail).
- * For a personal / classroom project this is perfectly fine.
+ * Security note: User code runs directly on the server process.
+ * Acceptable for personal / educational projects. Add Docker sandboxing
+ * for a public-facing platform with untrusted users.
  */
 
 const { spawn } = require("child_process");
-const fs = require("fs");
+const fs   = require("fs");
 const path = require("path");
-const os = require("os");
+const os   = require("os");
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/**
- * Write `content` to a temporary file and return its absolute path.
- */
 function writeTempFile(content, extension) {
-  const name = `algoarena_${Date.now()}_${Math.random()
-    .toString(36)
-    .slice(2)}${extension}`;
-  const filePath = path.join(os.tmpdir(), name);
-  fs.writeFileSync(filePath, content, "utf8");
-  return filePath;
+  const name = `algoarena_${Date.now()}_${Math.random().toString(36).slice(2)}${extension}`;
+  const fp   = path.join(os.tmpdir(), name);
+  fs.writeFileSync(fp, content, "utf8");
+  return fp;
+}
+
+function safeDelete(fp) {
+  try { fs.unlinkSync(fp); } catch (_) {}
 }
 
 /**
- * Delete a file if it exists (best-effort cleanup).
- */
-function safeDelete(filePath) {
-  try {
-    fs.unlinkSync(filePath);
-  } catch (_) {}
-}
-
-/**
- * Run a command as a child process with a hard timeout.
- *
- * @param {string}   cmd       - executable (e.g. "python", "node")
- * @param {string[]} args      - argument list
- * @param {string}   stdin     - string to pipe into stdin
- * @param {number}   timeoutMs - kill timeout in milliseconds
- * @returns {Promise<{stdout, stderr, exitCode, timedOut, elapsedMs}>}
+ * Spawn a process, pipe stdin, collect stdout/stderr, enforce a hard timeout.
  */
 function runProcess(cmd, args, stdin, timeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now();
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
+    let stdout = "", stderr = "", timedOut = false;
 
-    const child = spawn(cmd, args, {
-      env: process.env,
-      shell: false,
-    });
+    const child = spawn(cmd, args, { env: process.env, shell: false });
 
-    if (stdin) {
-      child.stdin.write(stdin);
-    }
+    if (stdin) child.stdin.write(stdin);
     child.stdin.end();
 
     child.stdout.on("data", (d) => (stdout += d.toString()));
@@ -83,7 +61,6 @@ function runProcess(cmd, args, stdin, timeoutMs) {
       clearTimeout(timer);
       resolve({ stdout, stderr, exitCode, timedOut, elapsedMs: Date.now() - start });
     });
-
     child.on("error", (err) => {
       clearTimeout(timer);
       resolve({ stdout: "", stderr: err.message, exitCode: -1, timedOut: false, elapsedMs: Date.now() - start });
@@ -91,30 +68,35 @@ function runProcess(cmd, args, stdin, timeoutMs) {
   });
 }
 
-// ─── Language Runners ────────────────────────────────────────────────────────
+// ─── Language runners ─────────────────────────────────────────────────────────
 
 async function runJavaScript(code, input, timeoutMs) {
-  const filePath = writeTempFile(code, ".js");
+  const fp = writeTempFile(code, ".js");
   try {
-    return await runProcess("node", [filePath], input, timeoutMs);
+    return await runProcess("node", [fp], input, timeoutMs);
   } finally {
-    safeDelete(filePath);
+    safeDelete(fp);
   }
 }
 
 async function runPython(code, input, timeoutMs) {
-  const filePath = writeTempFile(code, ".py");
+  const fp = writeTempFile(code, ".py");
   try {
-    // -u = unbuffered so partial output is never lost
-    return await runProcess("python", ["-u", filePath], input, timeoutMs);
+    // -u = unbuffered I/O (no lost output on crash)
+    // Try "python3" first (Linux/Render), fall back to "python" (Windows/some Linux)
+    let result = await runProcess("python3", ["-u", fp], input, timeoutMs);
+    if (result.exitCode === -1 && result.stderr.includes("ENOENT")) {
+      result = await runProcess("python", ["-u", fp], input, timeoutMs);
+    }
+    return result;
   } finally {
-    safeDelete(filePath);
+    safeDelete(fp);
   }
 }
 
 /**
- * Compile and execute Java.
- * The submitted class MUST be named `Main` (standard competitive programming convention).
+ * Java: compile with javac, then run.
+ * Submission MUST declare `public class Main` (competitive programming convention).
  */
 async function runJava(code, input, timeoutMs) {
   const subDir = path.join(
@@ -126,9 +108,8 @@ async function runJava(code, input, timeoutMs) {
   fs.writeFileSync(javaFile, code, "utf8");
 
   try {
-    // Step 1 — Compile (10 s hard limit)
+    // Compile (10 s hard limit)
     const compile = await runProcess("javac", [javaFile], "", 10_000);
-
     if (compile.exitCode !== 0 || compile.timedOut) {
       return {
         stdout: "",
@@ -138,71 +119,59 @@ async function runJava(code, input, timeoutMs) {
         elapsedMs: compile.elapsedMs,
       };
     }
-
-    // Step 2 — Run
+    // Run
     return await runProcess("java", ["-cp", subDir, "Main"], input, timeoutMs);
   } finally {
     try { fs.rmSync(subDir, { recursive: true, force: true }); } catch (_) {}
   }
 }
 
-// ─── Main Export ─────────────────────────────────────────────────────────────
+// ─── Main export ──────────────────────────────────────────────────────────────
 
 /**
- * Execute user code and return a normalised result object.
+ * Execute user code against a single test case.
  *
- * @param {string} language          - "javascript" | "python" | "java"
- * @param {string} code              - source code from the submission
- * @param {string} input             - test-case input piped to stdin
+ * @param {string} language           "javascript" | "python" | "java"
+ * @param {string} code               user's source code
+ * @param {string} input              test-case input piped to stdin
  * @param {number} [timeLimitSeconds=2]
  *
  * @returns {Promise<{
  *   output: string|null,
  *   error:  string|null,
- *   executionTime: number,   // wall-clock seconds
- *   memoryUsed: number,      // 0 — cross-platform tracking is non-trivial
- *   verdict: string|null,    // "Time Limit Exceeded" | null
+ *   executionTime: number,    // seconds
+ *   memoryUsed: number,       // 0 (tracking is non-trivial cross-platform)
+ *   verdict: string|null,     // "Time Limit Exceeded" | "Runtime Error" | null
  * }>}
  */
 const executeCode = async (language, code, input, timeLimitSeconds = 2) => {
   const timeoutMs = timeLimitSeconds * 1000;
+  const lang      = language.toLowerCase();
   let raw;
 
   try {
-    switch (language.toLowerCase()) {
-      case "javascript":
-      case "js":
-        raw = await runJavaScript(code, input, timeoutMs);
-        break;
-      case "python":
-      case "python3":
-        raw = await runPython(code, input, timeoutMs);
-        break;
-      case "java":
-        raw = await runJava(code, input, timeoutMs);
-        break;
-      default:
-        return {
-          output: null,
-          error: `Unsupported language: "${language}". Supported: javascript, python, java.`,
-          executionTime: 0,
-          memoryUsed: 0,
-          verdict: "Runtime Error",
-        };
+    if      (lang === "javascript" || lang === "js")      raw = await runJavaScript(code, input, timeoutMs);
+    else if (lang === "python"     || lang === "python3") raw = await runPython(code, input, timeoutMs);
+    else if (lang === "java")                             raw = await runJava(code, input, timeoutMs);
+    else {
+      return {
+        output: null,
+        error: `Unsupported language: "${language}". Supported: javascript, python, java.`,
+        executionTime: 0, memoryUsed: 0, verdict: "Runtime Error",
+      };
     }
   } catch (err) {
+    console.error("[Judge] Execution error:", err.message);
     return { output: null, error: err.message, executionTime: 0, memoryUsed: 0, verdict: "Runtime Error" };
   }
 
   if (raw.timedOut) {
     return { output: null, error: "Time Limit Exceeded", executionTime: timeLimitSeconds, memoryUsed: 0, verdict: "Time Limit Exceeded" };
   }
-
   if (raw.exitCode !== 0 && raw.stderr) {
     return { output: null, error: raw.stderr.trim(), executionTime: raw.elapsedMs / 1000, memoryUsed: 0, verdict: null };
   }
-
   return { output: raw.stdout, error: raw.stderr || null, executionTime: raw.elapsedMs / 1000, memoryUsed: 0, verdict: null };
 };
 
-module.exports = executeCode;
+module.exports = executeCode;
